@@ -1,3 +1,14 @@
+---
+title: SEC 10-K Search — Pinecone FTS vs Dense
+emoji: 🔎
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8501
+pinned: false
+short_description: Pinecone full-text search vs dense vectors on 10-Ks
+---
+
 # SEC Document Search — Pinecone FTS + Semantic
 
 A demo application showing how to build a hybrid search system over SEC 10-K filings using [Pinecone's full-text search (preview)](https://docs.pinecone.io/guides/search/full-text-search) combined with dense vector embeddings.
@@ -116,6 +127,29 @@ Sidebar ticker/year filters apply to both sides. The results show:
 | Side by side | Both ranked lists, with badges showing each result's rank in the other list, and keyword highlighting on both |
 | Rank comparison | One table of every retrieved chunk with its dense rank, full-text rank and Δ |
 | Fused (RRF) | Client-side reciprocal rank fusion (k = 60) of the two lists — a preview of a two-query hybrid |
+
+## Deploying to Hugging Face Spaces
+
+The repo is set up as a [Docker Space](https://huggingface.co/docs/hub/spaces-sdks-docker) (Streamlit is no longer a built-in Spaces SDK). The YAML block at the top of this README is the Space config; `Dockerfile` + `requirements.txt` define the container.
+
+1. Create the Space (Docker SDK; requires a PRO / Team plan):
+   ```bash
+   hf repos create <owner>/<space-name> --repo-type space --space-sdk docker
+   ```
+2. In the Space **Settings → Secrets**, add `PINECONE_API_KEY` (ideally a read-only key) and `OPENAI_API_KEY`.
+3. Upload — always exclude `.env`, since `hf upload` does not read `.gitignore`:
+   ```bash
+   hf upload <owner>/<space-name> . . --repo-type space \
+     --exclude ".env" ".venv/*" "example_data/*" ".claude/*" ".git/*"
+   ```
+
+Test the container locally first:
+
+```bash
+docker build -t sec-fts . && docker run --rm -p 8501:8501 --env-file .env sec-fts
+```
+
+The Pinecone SDK is pinned to 9.x: the app uses the FTS preview API (`pc.preview`), which SDK 10 removed.
 
 ## Index schema
 

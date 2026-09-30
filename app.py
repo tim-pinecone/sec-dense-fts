@@ -15,6 +15,8 @@ import fts_queries as fq
 
 load_dotenv()
 
+_missing_env = [k for k in ("PINECONE_API_KEY", "OPENAI_API_KEY") if not os.environ.get(k)]
+
 INDEX_NAME = "sec-fts"
 NAMESPACE = "__default__"
 EMBED_MODEL = "text-embedding-3-small"
@@ -635,6 +637,13 @@ def render_compare(top_k: int, tickers: list, years: list):
 # ── Layout ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SEC Search", layout="wide")
 st.title("SEC Document Search")
+
+if _missing_env:
+    st.error(
+        f"Missing environment variable(s): {', '.join(_missing_env)}. "
+        "Set them in `.env` locally, or as Secrets in the Hugging Face Space settings."
+    )
+    st.stop()
 
 mode = st.radio(
     "Search mode",
