@@ -3,15 +3,17 @@ title: SEC 10-K Search — Pinecone FTS vs Dense
 emoji: 🔎
 colorFrom: blue
 colorTo: indigo
-sdk: docker
-app_port: 8501
+sdk: gradio
+sdk_version: 6.29.0
+python_version: '3.12'
+app_file: app.py
 pinned: false
 short_description: Pinecone full-text search vs dense vectors on 10-Ks
 ---
 
 # SEC Document Search — Pinecone FTS + Semantic
 
-A demo application showing how to build a hybrid search system over SEC 10-K filings using [Pinecone's full-text search (preview)](https://docs.pinecone.io/guides/search/full-text-search) combined with dense vector embeddings.
+A demo application showing how to build a hybrid search system over SEC 10-K filings using [Pinecone's full-text search](https://docs.pinecone.io/guides/search/full-text-search) combined with dense vector embeddings.
 
 The app supports three search modes:
 
@@ -69,13 +71,14 @@ Ingestion takes a few minutes (OpenAI embedding calls are the bottleneck). The s
 
 ## Run the app
 
-```bash
-uv run streamlit run app.py
-```
+Two UIs share the same search logic (`search_core.py`, `fts_queries.py`):
 
-Open [http://localhost:8501](http://localhost:8501).
+| UI | Command | URL | Notes |
+|---|---|---|---|
+| Gradio | `uv run python app.py` | [http://localhost:7860](http://localhost:7860) | What the Hugging Face Space runs |
+| Streamlit | `uv run streamlit run app_streamlit.py` | [http://localhost:8501](http://localhost:8501) | Local development UI |
 
-Use the sidebar to filter by ticker and year, pick a search mode, and enter your query — or pick one of the prepared **Example queries** at the top of each mode (three per mode; ten in the query builder). Examples live in `fts_queries.py` (`MODE_EXAMPLES`, `EXAMPLES`).
+Both have the same five tabs/modes. Use the sidebar to filter by ticker and year, pick a search mode, and enter your query — or pick one of the prepared **Example queries** at the top of each mode (three per mode; ten in the query builder). Examples live in `fts_queries.py` (`MODE_EXAMPLES`, `EXAMPLES`).
 
 ## Full-text query builder
 
@@ -130,26 +133,19 @@ Sidebar ticker/year filters apply to both sides. The results show:
 
 ## Deploying to Hugging Face Spaces
 
-The repo is set up as a [Docker Space](https://huggingface.co/docs/hub/spaces-sdks-docker) (Streamlit is no longer a built-in Spaces SDK). The YAML block at the top of this README is the Space config; `Dockerfile` + `requirements.txt` define the container.
+The Space runs the **Gradio** app (`app.py`) on free ZeroGPU hardware — no Docker needed. The YAML block at the top of this README is the Space config, and `requirements.txt` holds the Space's Python dependencies (Gradio itself comes from `sdk_version`). ZeroGPU requires at least one `@spaces.GPU` function; `app.py` defines a no-op one since all compute happens in Pinecone and OpenAI.
 
-1. Create the Space (Docker SDK; requires a PRO / Team plan):
+1. Add a Hugging Face write token to `.env` as `HF_TOKEN`.
+2. Preview what will be uploaded:
    ```bash
-   hf repos create <owner>/<space-name> --repo-type space --space-sdk docker
+   uv run python deploy_space.py <owner>/<space-name> --dry-run
    ```
-2. In the Space **Settings → Secrets**, add `PINECONE_API_KEY` (ideally a read-only key) and `OPENAI_API_KEY`.
-3. Upload — always exclude `.env`, since `hf upload` does not read `.gitignore`:
+3. Deploy. The first run creates the Space; `--set-secrets` copies `PINECONE_API_KEY` and `OPENAI_API_KEY` from `.env` into the Space's secrets (only needed once, or when keys change):
    ```bash
-   hf upload <owner>/<space-name> . . --repo-type space \
-     --exclude ".env" ".venv/*" "example_data/*" ".claude/*" ".git/*"
+   uv run python deploy_space.py <owner>/<space-name> --set-secrets [--private]
    ```
 
-Test the container locally first:
-
-```bash
-docker build -t sec-fts . && docker run --rm -p 8501:8501 --env-file .env sec-fts
-```
-
-The Pinecone SDK is pinned to 9.x: the app uses the FTS preview API (`pc.preview`), which SDK 10 removed.
+`deploy_space.py` uploads an explicit allowlist (`README.md`, `requirements.txt`, `app.py`, `search_core.py`, `fts_queries.py`), so `.env`, the example data, and the Streamlit app never leave your machine. Re-run it without `--set-secrets` to push code changes.
 
 ## Index schema
 

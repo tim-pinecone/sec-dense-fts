@@ -1,303 +1,72 @@
 import html
 import json
 import os
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
 
+import gradio as gr
 import pandas as pd
-import streamlit as st
-from dotenv import load_dotenv
-from openai import OpenAI
-from pinecone import Pinecone
 
 import fts_queries as fq
+from search_core import (
+    INCLUDE_FIELDS,
+    RRF_K,
+    TICKERS,
+    YEARS,
+    compare_stats,
+    highlight,
+    keyword_coverage,
+    match_record,
+    metadata_filter,
+    missing_env,
+    rank_badge,
+    rank_rows,
+    rrf_fuse,
+    run_compare,
+    run_search_hybrid,
+    run_search_semantic,
+    run_search_text,
+    search,
+)
 
-load_dotenv()
+os.environ["GRADIO_SSR_MODE"] = "False"
 
-_missing_env = [k for k in ("PINECONE_API_KEY", "OPENAI_API_KEY") if not os.environ.get(k)]
+try:
+    import spaces
 
-INDEX_NAME = "sec-fts"
-NAMESPACE = "__default__"
-EMBED_MODEL = "text-embedding-3-small"
-
-TICKERS = ["aapl", "amzn", "f", "gm", "msft", "orcl"]
-YEARS = list(range(2019, 2025))
-INCLUDE_FIELDS = ["text", "ticker", "filing_type", "year", "chunk_index"]
-
-
-@st.cache_resource
-def get_clients():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-    oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    idx = pc.preview.index(name=INDEX_NAME)
-    return oai, idx
-
-
-def _get_oai():
-    oai, _ = get_clients()
-    return oai
-
-
-def _get_idx():
-    _, idx = get_clients()
-    return idx
-
-
-@st.cache_data(show_spinner=False)
-def embed(text: str) -> list[float]:
-    resp = _get_oai().embeddings.create(model=EMBED_MODEL, input=[text])
-    return resp.data[0].embedding
+    @spaces.GPU
+    def zero_gpu_noop():
+        return True
+except Exception:
+    def zero_gpu_noop():
+        return False
 
 
-def build_filter(tickers: list[str], years: list[int]) -> dict | None:
-    filt = {}
-    if tickers:
-        filt["ticker"] = {"$in": tickers}
-    if years:
-        filt["year"] = {"$in": years}
-    return filt or None
+BLANK = "— Start from scratch —"
+N_CLAUSES = 6
+N_TEXT_FILTERS = 4
+ANY_YEAR = "Any"
+BUILDER_EXAMPLES = {ex["name"]: ex for ex in fq.EXAMPLES}
 
+CSS = """
+.card {border: 1px solid var(--border-color-primary); border-radius: 8px; padding: 10px 12px;
+       margin-bottom: 8px; background: var(--block-background-fill);}
+.card .hdr {display: flex; justify-content: space-between; gap: 8px; font-size: 14px;}
+.card .score {font-variant-numeric: tabular-nums; color: var(--body-text-color-subdued);}
+.card .badge {font-size: 12px; color: var(--body-text-color-subdued); margin-top: 2px;}
+.card .snip {font-size: 13px; line-height: 1.45; margin-top: 6px;}
+.card details {font-size: 13px; margin-top: 4px;}
+.card mark, .snip mark {background: rgba(250, 204, 21, .45); color: inherit; padding: 0 1px; border-radius: 2px;}
+.count {font-size: 13px; color: var(--body-text-color-subdued); margin: 4px 0 8px;}
+.err {border: 1px solid #dc2626; border-radius: 8px; padding: 10px 12px; color: #dc2626;}
+.metrics {display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 4px 0 8px;}
+.metric {border: 1px solid var(--border-color-primary); border-radius: 8px; padding: 8px 10px;}
+.metric .label {font-size: 12px; color: var(--body-text-color-subdued);}
+.metric .value {font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums;}
+.metric .sub {font-size: 12px; color: var(--body-text-color-subdued);}
+.cols {display: grid; grid-template-columns: 1fr 1fr; gap: 12px;}
+@media (max-width: 800px) {.cols {grid-template-columns: 1fr;}}
+"""
 
-def run_search_text(query: str, tickers: list, years: list, top_k: int):
-    filt = build_filter(tickers, years)
-    return _get_idx().documents.search(
-        namespace=NAMESPACE,
-        top_k=top_k,
-        score_by=[{"type": "text", "field": "text", "query": query}],
-        **{"filter": filt} if filt else {},
-        include_fields=["text", "ticker", "filing_type", "year", "chunk_index"],
-    )
-
-
-def run_search_semantic(query: str, tickers: list, years: list, top_k: int):
-    emb = embed(query)
-    filt = build_filter(tickers, years)
-    return _get_idx().documents.search(
-        namespace=NAMESPACE,
-        top_k=top_k,
-        score_by=[{"type": "dense_vector", "field": "embedding", "values": emb}],
-        **{"filter": filt} if filt else {},
-        include_fields=["text", "ticker", "filing_type", "year", "chunk_index"],
-    )
-
-
-def run_search_hybrid(
-    semantic_query: str,
-    text_filter: str,
-    tickers: list,
-    years: list,
-    top_k: int,
-):
-    emb = embed(semantic_query)
-    filt = build_filter(tickers, years) or {}
-    if text_filter.strip():
-        filt["text"] = {"$match_all": text_filter.strip()}
-    return _get_idx().documents.search(
-        namespace=NAMESPACE,
-        top_k=top_k,
-        score_by=[{"type": "dense_vector", "field": "embedding", "values": emb}],
-        **{"filter": filt} if filt else {},
-        include_fields=["text", "ticker", "filing_type", "year", "chunk_index"],
-    )
-
-
-def highlight(text: str, terms: list[str]) -> tuple[str, str]:
-    escaped = html.escape(text)
-    if not terms:
-        return escaped[:300] + ("..." if len(escaped) > 300 else ""), escaped
-    pattern = term_pattern(terms)
-    marked = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", escaped)
-
-    first = pattern.search(escaped)
-    start = max(0, first.start() - 150) if first else 0
-    snippet_raw = escaped[start : start + 450]
-    snippet = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", snippet_raw)
-    snippet = ("..." if start else "") + snippet + ("..." if start + 450 < len(escaped) else "")
-    return snippet, marked
-
-
-def term_pattern(terms: list[str]) -> re.Pattern | None:
-    if not terms:
-        return None
-    stems = [re.escape(t[:-2] if len(t) > 5 else t) for t in terms]
-    return re.compile(r"\b(" + "|".join(stems) + r")\w*", re.IGNORECASE)
-
-
-def keyword_coverage(text: str, terms: list[str]) -> tuple[int, int]:
-    hits = sum(1 for t in terms if term_pattern([t]).search(text))
-    return hits, len(terms)
-
-
-def match_record(m) -> dict:
-    d = m.to_dict()
-    return {
-        "id": getattr(m, "_id", d.get("_id")),
-        "score": getattr(m, "_score", getattr(m, "score", 0.0)),
-        "ticker": str(d.get("ticker", "?")).upper(),
-        "year": int(d.get("year", 0)),
-        "filing": str(d.get("filing_type", "")).upper(),
-        "chunk": int(d["chunk_index"]) if d.get("chunk_index") is not None else "?",
-        "text": str(d.get("text", "")),
-    }
-
-
-def render_card(r: dict, terms: list[str], rank: int | None = None, badge: str | None = None):
-    with st.container(border=True):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            prefix = f"**#{rank}** · " if rank else ""
-            st.markdown(f"{prefix}**{r['ticker']}** · {r['year']} · {r['filing']} · chunk {r['chunk']}")
-            if badge:
-                st.caption(badge)
-        with col2:
-            st.metric("score", f"{r['score']:.4f}", label_visibility="collapsed")
-
-        snippet, full = highlight(r["text"], terms)
-        st.markdown(f"<small>{snippet}</small>", unsafe_allow_html=True)
-        if len(r["text"]) > 300:
-            with st.expander("Full text"):
-                st.markdown(f"<small>{full}</small>", unsafe_allow_html=True)
-
-
-def render_results(matches, terms: list[str] | None = None):
-    if not matches:
-        st.info("No results found.")
-        return
-
-    st.caption(f"{len(matches)} result(s)")
-    for m in matches:
-        render_card(match_record(m), terms or [])
-
-
-# ── Query builder state ───────────────────────────────────────────────────────
-SCORING_LABELS = {"query_string": "Lucene (query_string)", "text": "BM25 keywords (text)"}
-LUCENE_MODE_LABELS = {"clauses": "Clause builder", "raw": "Raw Lucene"}
-BLANK_EXAMPLE = "— Start from scratch —"
-EXAMPLES_BY_NAME = {ex["name"]: ex for ex in fq.EXAMPLES}
-CLAUSE_COLUMNS = ["occur", "kind", "value", "slop", "boost"]
-TEXT_FILTER_COLUMNS = ["op", "value", "negate"]
-
-
-def load_builder_state(state: dict):
-    ss = st.session_state
-    ss.b_scoring = state["scoring"]
-    ss.b_bm25 = state["bm25"]
-    ss.b_lucene_mode = state["lucene_mode"]
-    ss.b_raw = state["raw"]
-    ss.b_clauses_data = [dict(c) for c in state["clauses"]]
-    ss.b_tf_data = [dict(f) for f in state["text_filters"]]
-    ss.b_tf_join = state["text_filter_join"]
-    ss.b_tickers = list(state["tickers"])
-    ss.b_excl = list(state["exclude_tickers"])
-    ss.b_year_on = state["year_range"] is not None
-    ss.b_year = tuple(state["year_range"] or (YEARS[0], YEARS[-1]))
-    ss.b_chunk_on = state["chunk_range"] is not None
-    ss.b_chunk = tuple(state["chunk_range"] or (0, 1500))
-    ss.b_clauses_current = ss.b_clauses_data
-    ss.b_tf_current = ss.b_tf_data
-    ss.b_ver = ss.get("b_ver", 0) + 1
-
-
-def on_example_change():
-    ex = EXAMPLES_BY_NAME.get(st.session_state.b_example)
-    load_builder_state(ex["state"] if ex else fq.BLANK)
-
-
-def on_lucene_mode_change():
-    ss = st.session_state
-    if ss.b_lucene_mode == "raw" and not ss.b_raw.strip():
-        try:
-            ss.b_raw = fq.clauses_to_lucene(ss.get("b_clauses_current", ss.b_clauses_data))
-        except fq.QueryError:
-            pass
-
-
-def editor_rows(df: pd.DataFrame) -> list[dict]:
-    rows = []
-    for rec in df.to_dict("records"):
-        rec = {k: None if pd.isna(v) else v for k, v in rec.items()}
-        if str(rec.get("value") or "").strip():
-            rows.append(rec)
-    return rows
-
-
-def apply_mode_example(mode: str):
-    ss = st.session_state
-    ex = next((e for e in fq.MODE_EXAMPLES[mode] if e["name"] == ss[f"ex_{mode}"]), None)
-    if not ex:
-        return
-    for key, value in ex["values"].items():
-        ss[key] = value
-    if ex.get("builder_example"):
-        load_builder_state(EXAMPLES_BY_NAME[ex["builder_example"]]["state"])
-        ss.b_example = ex["builder_example"]
-    ss.pop("c_results", None)
-
-
-def example_picker(mode: str):
-    examples = fq.MODE_EXAMPLES[mode]
-    st.selectbox(
-        "Example queries",
-        [BLANK_EXAMPLE] + [e["name"] for e in examples],
-        key=f"ex_{mode}",
-        on_change=apply_mode_example,
-        args=(mode,),
-    )
-    ex = next((e for e in examples if e["name"] == st.session_state[f"ex_{mode}"]), None)
-    if ex:
-        st.info(ex["description"])
-
-
-BUILDER_KEYS = [
-    "b_example", "b_scoring", "b_bm25", "b_lucene_mode", "b_raw", "b_tf_join",
-    "b_tickers", "b_excl", "b_year_on", "b_year", "b_chunk_on", "b_chunk",
-]
-
-if "b_ver" not in st.session_state:
-    load_builder_state(fq.BLANK)
-    st.session_state.b_example = BLANK_EXAMPLE
-# Re-assigning keeps state for widgets that are hidden on this run; Streamlit
-# otherwise drops it, which would wipe the query when toggling scoring modes.
-for _k in BUILDER_KEYS:
-    st.session_state[_k] = st.session_state[_k]
-
-
-def current_builder_state() -> dict:
-    ss = st.session_state
-    return {
-        "scoring": ss.b_scoring,
-        "bm25": ss.b_bm25,
-        "lucene_mode": ss.b_lucene_mode,
-        "clauses": ss.b_clauses_current,
-        "raw": ss.b_raw,
-        "text_filters": ss.b_tf_current,
-        "text_filter_join": ss.b_tf_join,
-        "tickers": ss.b_tickers,
-        "exclude_tickers": ss.b_excl,
-        "year_range": ss.b_year if ss.b_year_on else None,
-        "chunk_range": ss.b_chunk if ss.b_chunk_on else None,
-    }
-
-
-def render_builder(top_k: int):
-    ss = st.session_state
-    ver = ss.b_ver
-
-    st.selectbox(
-        "Example queries",
-        [BLANK_EXAMPLE] + list(EXAMPLES_BY_NAME),
-        key="b_example",
-        on_change=on_example_change,
-        help="Load a pre-built complex query into the builder, then tweak it.",
-    )
-    ex = EXAMPLES_BY_NAME.get(ss.b_example)
-    if ex:
-        st.info(f"**Demonstrates:** {ex['shows']}\n\n{ex['description']}")
-
-    with st.expander("Syntax cheat sheet"):
-        st.markdown(
-            """
+CHEAT_SHEET = """
 | Goal | Lucene (`query_string` scoring) | Filter operator (hard constraint, no scoring) |
 |---|---|---|
 | Any of these terms | `text:(cloud revenue)` | `{"text": {"$match_any": "cloud revenue"}}` |
@@ -315,405 +84,433 @@ def render_builder(top_k: int):
 - A Lucene query made only of exclusions (`-covid`) is rejected — include at least one positive clause.
 - Phrase-prefix matches all get the same constant score.
 """
-        )
 
-    st.subheader("1 · Scoring (ranks results)")
-    st.radio(
-        "Scoring type",
-        list(SCORING_LABELS),
-        format_func=SCORING_LABELS.get,
-        key="b_scoring",
-        horizontal=True,
-        label_visibility="collapsed",
+
+def card_html(r: dict, terms: list[str], rank: int | None = None, badge: str | None = None) -> str:
+    snippet, full = highlight(r["text"], terms)
+    prefix = f"<b>#{rank}</b> · " if rank else ""
+    meta = f"{prefix}<b>{html.escape(r['ticker'])}</b> · {r['year']} · {html.escape(r['filing'])} · chunk {r['chunk']}"
+    badge_html = f"<div class='badge'>{html.escape(badge)}</div>" if badge else ""
+    more = f"<details><summary>Full text</summary>{full}</details>" if len(r["text"]) > 300 else ""
+    return (
+        f"<div class='card'><div class='hdr'><span>{meta}</span><span class='score'>{r['score']:.4f}</span></div>"
+        f"{badge_html}<div class='snip'>{snippet}</div>{more}</div>"
     )
 
-    clauses = ss.b_clauses_current
-    if ss.b_scoring == "text":
-        st.text_input(
-            "BM25 keywords",
-            key="b_bm25",
-            placeholder="e.g. battery cells charging range",
-            help="Token-OR BM25: documents matching more / rarer terms score higher.",
-        )
-    else:
-        st.radio(
-            "Lucene input",
-            list(LUCENE_MODE_LABELS),
-            format_func=LUCENE_MODE_LABELS.get,
-            key="b_lucene_mode",
-            on_change=on_lucene_mode_change,
-            horizontal=True,
-        )
-        if ss.b_lucene_mode == "clauses":
-            st.caption(
-                "Each row is one clause. **MUST** → `+`, **MUST NOT** → `-`, **SHOULD** → optional "
-                "(adds score). Slop applies to phrases; boost multiplies a clause's weight."
-            )
-            edited = st.data_editor(
-                pd.DataFrame(clauses, columns=CLAUSE_COLUMNS),
-                key=f"b_clauses_{ver}",
-                num_rows="dynamic",
-                width="stretch",
-                column_config={
-                    "occur": st.column_config.SelectboxColumn("Occur", options=fq.OCCURS, default="SHOULD", required=True),
-                    "kind": st.column_config.SelectboxColumn("Kind", options=fq.KINDS, default="term(s)", required=True),
-                    "value": st.column_config.TextColumn("Value", width="large"),
-                    "slop": st.column_config.NumberColumn("Slop (~N)", min_value=0, max_value=50, step=1, default=0),
-                    "boost": st.column_config.NumberColumn("Boost (^N)", min_value=0.1, max_value=20.0, step=0.5, default=1.0),
-                },
-            )
-            clauses = editor_rows(edited)
-            ss.b_clauses_current = clauses
-        else:
-            st.text_area(
-                "Lucene query",
-                key="b_raw",
-                height=90,
-                placeholder='text:(("supply chain" OR semiconductor) AND shortage) NOT text:(covid)',
-                help="Qualify terms with the field name: text:(...). AND / OR / NOT, +required, -excluded, "
-                '"phrase"~N, term^N, "two words"*.',
-            )
 
-    st.subheader("2 · Filters (hard constraints)")
-    st.markdown("**Text-match filters** on the `text` field")
-    edited_tf = st.data_editor(
-        pd.DataFrame(ss.b_tf_data, columns=TEXT_FILTER_COLUMNS),
-        key=f"b_tf_{ver}",
-        num_rows="dynamic",
-        width="stretch",
-        column_config={
-            "op": st.column_config.SelectboxColumn("Operator", options=fq.MATCH_OPS, default="$match_phrase", required=True),
-            "value": st.column_config.TextColumn("Value", width="large"),
-            "negate": st.column_config.CheckboxColumn("NOT", default=False, help="Wrap in $not (exclude matches)"),
-        },
-    )
-    text_filters = editor_rows(edited_tf)
-    ss.b_tf_current = text_filters
-    if len(text_filters) > 1:
-        st.radio(
-            "Combine text-match filters with",
-            ["all", "any"],
-            format_func={"all": "AND ($and) — every condition", "any": "OR ($or) — at least one"}.get,
-            key="b_tf_join",
-            horizontal=True,
-        )
+def results_html(records: list[dict], terms: list[str]) -> str:
+    if not records:
+        return "<div class='count'>No results found.</div>"
+    cards = "".join(card_html(r, terms) for r in records)
+    return f"<div class='count'>{len(records)} result(s)</div>{cards}"
 
-    st.markdown("**Metadata filters**")
-    m1, m2 = st.columns(2)
-    with m1:
-        st.multiselect("Ticker is one of ($in)", TICKERS, key="b_tickers", placeholder="Any")
-        st.checkbox("Year range ($gte / $lte)", key="b_year_on")
-        if ss.b_year_on:
-            st.slider("Years", YEARS[0], YEARS[-1], key="b_year", label_visibility="collapsed")
-    with m2:
-        st.multiselect("Ticker is not ($nin)", TICKERS, key="b_excl", placeholder="None")
-        st.checkbox("Chunk index range", key="b_chunk_on", help="Position of the chunk within the filing.")
-        if ss.b_chunk_on:
-            st.slider("Chunks", 0, 1500, key="b_chunk", label_visibility="collapsed")
 
-    state = current_builder_state()
+def error_html(message: str) -> str:
+    return f"<div class='err'>{html.escape(message)}</div>"
 
-    st.subheader("3 · Request")
+
+def metric_html(label: str, value: str, sub: str = "") -> str:
+    sub_html = f"<div class='sub'>{html.escape(sub)}</div>" if sub else ""
+    return f"<div class='metric'><div class='label'>{label}</div><div class='value'>{value}</div>{sub_html}</div>"
+
+
+def mode_example(mode: str, name: str, fields: list[str]):
+    ex = next((e for e in fq.MODE_EXAMPLES[mode] if e["name"] == name), None)
+    if not ex:
+        return [gr.update() for _ in fields] + [""]
+    return [ex["values"].get(f, "") for f in fields] + [f"ℹ️ {ex['description']}"]
+
+
+def do_fulltext(query, tickers, years, top_k):
+    if not query.strip():
+        return error_html("Enter a keyword query.")
     try:
-        req = fq.build_request(state, top_k, INCLUDE_FIELDS)
-    except fq.QueryError as e:
-        st.warning(str(e))
-        return
-
-    tab_json, tab_py = st.tabs(["JSON", "Python"])
-    with tab_json:
-        st.code(json.dumps(req, indent=2), language="json")
-    with tab_py:
-        st.code(fq.to_python(req), language="python")
-
-    if st.button("Search", type="primary", key="b_search"):
-        with st.spinner("Searching..."):
-            try:
-                resp = _get_idx().documents.search(**req)
-            except Exception as e:
-                st.error(f"Search failed: {e}")
-                return
-        render_results(resp.matches, fq.highlight_terms(state))
+        resp = run_search_text(query, tickers, years, int(top_k))
+    except Exception as e:
+        return error_html(f"Search failed: {e}")
+    terms = fq.highlight_terms({"scoring": "text", "bm25": query})
+    return results_html([match_record(m) for m in resp.matches], terms)
 
 
-# ── Compare: dense vs full-text ───────────────────────────────────────────────
-RRF_K = 60
-FTS_SOURCES = {"same": "Same query as BM25 keywords", "builder": "Current query-builder query"}
+def do_semantic(query, tickers, years, top_k):
+    if not query.strip():
+        return error_html("Enter a semantic query.")
+    try:
+        resp = run_search_semantic(query, tickers, years, int(top_k))
+    except Exception as e:
+        return error_html(f"Search failed: {e}")
+    return results_html([match_record(m) for m in resp.matches], [])
 
 
-def and_filters(*filters: dict | None) -> dict | None:
-    parts = [f for f in filters if f]
-    if not parts:
-        return None
-    return parts[0] if len(parts) == 1 else {"$and": parts}
+def do_hybrid(sem_query, txt_filter, tickers, years, top_k):
+    if not sem_query.strip():
+        return error_html("Enter a semantic query.")
+    try:
+        resp = run_search_hybrid(sem_query, txt_filter, tickers, years, int(top_k))
+    except Exception as e:
+        return error_html(f"Search failed: {e}")
+    terms = fq.highlight_terms({"scoring": "text", "bm25": txt_filter})
+    return results_html([match_record(m) for m in resp.matches], terms)
 
 
-def timed(fn):
-    start = time.perf_counter()
-    result = fn()
-    return result, (time.perf_counter() - start) * 1000
+def builder_state(values: list) -> dict:
+    it = iter(values)
+    scoring, bm25, lucene_mode, raw = next(it), next(it), next(it), next(it)
+    clauses = []
+    for _ in range(N_CLAUSES):
+        occur, kind, value, slop, boost = (next(it) for _ in range(5))
+        if str(value or "").strip():
+            clauses.append({"occur": occur, "kind": kind, "value": value, "slop": slop or 0, "boost": boost or 1.0})
+    text_filters = []
+    for _ in range(N_TEXT_FILTERS):
+        op, value, negate = next(it), next(it), next(it)
+        if str(value or "").strip():
+            text_filters.append({"op": op, "value": value, "negate": bool(negate)})
+    join, tickers, excl, year_from, year_to, chunk_min, chunk_max = (next(it) for _ in range(7))
 
-
-def run_compare(query: str, fts_state: dict, base_filter: dict | None, dense_extra_filter: dict | None, top_k: int):
-    fts_req = fq.build_request(fts_state, top_k, INCLUDE_FIELDS)
-    fts_req["filter"] = and_filters(fts_req.get("filter"), base_filter)
-    if not fts_req["filter"]:
-        del fts_req["filter"]
-
-    def dense():
-        vec, embed_ms = timed(lambda: embed(query))
-        dense_filter = and_filters(base_filter, dense_extra_filter)
-        req = {
-            "namespace": NAMESPACE,
-            "top_k": top_k,
-            "score_by": [{"type": "dense_vector", "field": "embedding", "values": vec}],
-            "include_fields": INCLUDE_FIELDS,
-            **({"filter": dense_filter} if dense_filter else {}),
-        }
-        resp, search_ms = timed(lambda: _get_idx().documents.search(**req))
-        return resp, embed_ms, search_ms
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        dense_future = pool.submit(dense)
-        fts_future = pool.submit(timed, lambda: _get_idx().documents.search(**fts_req))
-        dense_resp, embed_ms, dense_ms = dense_future.result()
-        fts_resp, fts_ms = fts_future.result()
+    year_range = None
+    if year_from != ANY_YEAR or year_to != ANY_YEAR:
+        lo = int(year_from) if year_from != ANY_YEAR else YEARS[0]
+        hi = int(year_to) if year_to != ANY_YEAR else YEARS[-1]
+        year_range = (min(lo, hi), max(lo, hi))
+    chunk_range = None
+    if chunk_min is not None or chunk_max is not None:
+        chunk_range = (int(chunk_min or 0), int(chunk_max if chunk_max is not None else 100000))
 
     return {
-        "dense": [match_record(m) for m in dense_resp.matches],
-        "fts": [match_record(m) for m in fts_resp.matches],
-        "embed_ms": embed_ms,
-        "dense_ms": dense_ms,
-        "fts_ms": fts_ms,
-        "fts_req": fts_req,
-        "terms": fq.highlight_terms(fts_state),
+        "scoring": scoring,
+        "bm25": bm25,
+        "lucene_mode": lucene_mode,
+        "clauses": clauses,
+        "raw": raw,
+        "text_filters": text_filters,
+        "text_filter_join": join,
+        "tickers": tickers or [],
+        "exclude_tickers": excl or [],
+        "year_range": year_range,
+        "chunk_range": chunk_range,
     }
 
 
-def rank_badge(doc_id: str, other_ranks: dict, other_name: str) -> str:
-    if doc_id in other_ranks:
-        return f"🔁 also #{other_ranks[doc_id]} in {other_name}"
-    return f"◆ only in {'dense' if other_name == 'full-text' else 'full-text'}"
+def builder_preview(top_k, *values):
+    try:
+        req = fq.build_request(builder_state(list(values)), int(top_k), INCLUDE_FIELDS)
+    except fq.QueryError as e:
+        return "", "", f"⚠️ {e}"
+    return json.dumps(req, indent=2), fq.to_python(req), ""
 
 
-def render_compare_results(res: dict):
-    dense, fts, terms = res["dense"], res["fts"], res["terms"]
-    dense_rank = {r["id"]: i for i, r in enumerate(dense, 1)}
-    fts_rank = {r["id"]: i for i, r in enumerate(fts, 1)}
-    shared = dense_rank.keys() & fts_rank.keys()
-    union = dense_rank.keys() | fts_rank.keys()
-
-    def avg_coverage(rows):
-        if not rows or not terms:
-            return None
-        return sum(keyword_coverage(r["text"], terms)[0] / len(terms) for r in rows) / len(rows)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Overlap", f"{len(shared)} / {max(len(dense), len(fts))}",
-              f"Jaccard {len(shared) / len(union):.0%}" if union else None, delta_color="off")
-    c2.metric("Only dense", len(dense_rank.keys() - shared))
-    c3.metric("Only full-text", len(fts_rank.keys() - shared))
-    c4.metric("Dense latency", f"{res['embed_ms'] + res['dense_ms']:.0f} ms",
-              f"embed {res['embed_ms']:.0f} + search {res['dense_ms']:.0f}", delta_color="off")
-    c5.metric("Full-text latency", f"{res['fts_ms']:.0f} ms")
-
-    cov_d, cov_f = avg_coverage(dense), avg_coverage(fts)
-    if cov_d is not None:
-        st.caption(
-            f"**Keyword coverage** — average share of the full-text terms ({', '.join(terms)}) present in each result: "
-            f"dense **{cov_d:.0%}** vs full-text **{cov_f:.0%}**. Low dense coverage means it is finding "
-            "paraphrases and related concepts the keywords miss; low full-text rank overlap means lexical "
-            "matches the embedding doesn't consider close."
-        )
-
-    with st.expander("Full-text request sent"):
-        st.code(json.dumps(res["fts_req"], indent=2), language="json")
-
-    tab_side, tab_table, tab_rrf = st.tabs(["Side by side", "Rank comparison", "Fused (RRF)"])
-
-    with tab_side:
-        left, right = st.columns(2)
-        with left:
-            st.markdown("#### Dense (semantic)")
-            if not dense:
-                st.info("No results.")
-            for i, r in enumerate(dense, 1):
-                hits, n = keyword_coverage(r["text"], terms)
-                cov = f" · keywords {hits}/{n}" if n else ""
-                render_card(r, terms, rank=i, badge=rank_badge(r["id"], fts_rank, "full-text") + cov)
-        with right:
-            st.markdown("#### Full-text (BM25 / Lucene)")
-            if not fts:
-                st.info("No results.")
-            for i, r in enumerate(fts, 1):
-                hits, n = keyword_coverage(r["text"], terms)
-                cov = f" · keywords {hits}/{n}" if n else ""
-                render_card(r, terms, rank=i, badge=rank_badge(r["id"], dense_rank, "dense") + cov)
-
-    by_id = {r["id"]: r for r in dense + fts}
-
-    with tab_table:
-        rows = []
-        for doc_id in union:
-            r = by_id[doc_id]
-            d, f = dense_rank.get(doc_id), fts_rank.get(doc_id)
-            hits, n = keyword_coverage(r["text"], terms)
-            rows.append({
-                "ticker": r["ticker"],
-                "year": r["year"],
-                "chunk": r["chunk"],
-                "dense rank": d,
-                "full-text rank": f,
-                "Δ rank (dense − FTS)": d - f if d and f else None,
-                "found by": "both" if d and f else ("dense" if d else "full-text"),
-                "keywords": f"{hits}/{n}" if n else "",
-                "snippet": r["text"][:140].replace("\n", " "),
-            })
-        rows.sort(key=lambda x: min(x["dense rank"] or 999, x["full-text rank"] or 999))
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        st.caption("Δ rank < 0 → dense ranks it higher; > 0 → full-text ranks it higher. Blank rank = not in that top-k.")
-
-    with tab_rrf:
-        st.caption(
-            f"Reciprocal rank fusion merges both lists client-side: score = Σ 1 / ({RRF_K} + rank). "
-            "Documents found by both searches rise to the top — a preview of what a two-query hybrid returns."
-        )
-        fused = {}
-        for ranks in (dense_rank, fts_rank):
-            for doc_id, rank in ranks.items():
-                fused[doc_id] = fused.get(doc_id, 0.0) + 1 / (RRF_K + rank)
-        top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[: max(len(dense), len(fts))]
-        for i, (doc_id, score) in enumerate(top, 1):
-            r = {**by_id[doc_id], "score": score}
-            d, f = dense_rank.get(doc_id), fts_rank.get(doc_id)
-            badge = f"dense #{d if d else '—'} · full-text #{f if f else '—'}"
-            render_card(r, terms, rank=i, badge=badge)
+def builder_values_from_state(state: dict) -> list:
+    values = [state["scoring"], state["bm25"], state["lucene_mode"], state["raw"]]
+    clauses = [c for c in state["clauses"] if str(c.get("value") or "").strip()]
+    for i in range(N_CLAUSES):
+        c = clauses[i] if i < len(clauses) else {}
+        values += [c.get("occur", "SHOULD"), c.get("kind", "term(s)"), c.get("value", ""),
+                   c.get("slop", 0), c.get("boost", 1.0)]
+    for i in range(N_TEXT_FILTERS):
+        f = state["text_filters"][i] if i < len(state["text_filters"]) else {}
+        values += [f.get("op", "$match_phrase"), f.get("value", ""), f.get("negate", False)]
+    yr = state["year_range"]
+    ch = state["chunk_range"]
+    values += [
+        state["text_filter_join"],
+        list(state["tickers"]),
+        list(state["exclude_tickers"]),
+        str(yr[0]) if yr else ANY_YEAR,
+        str(yr[1]) if yr else ANY_YEAR,
+        ch[0] if ch else None,
+        ch[1] if ch else None,
+    ]
+    return values
 
 
-def render_compare(top_k: int, tickers: list, years: list):
-    ss = st.session_state
-    example_picker("compare")
-    query = st.text_input(
-        "Query",
-        key="c_query",
-        placeholder="e.g. risks from rising interest rates on consumer demand",
-        help="Embedded for the dense search. Also used as BM25 keywords unless the full-text side uses the query builder.",
+def visibility(scoring: str, lucene_mode: str):
+    lucene = scoring == "query_string"
+    return (
+        gr.update(visible=not lucene),
+        gr.update(visible=lucene),
+        gr.update(visible=lucene and lucene_mode == "clauses"),
+        gr.update(visible=lucene and lucene_mode == "raw"),
     )
-    source = st.radio("Full-text side", list(FTS_SOURCES), format_func=FTS_SOURCES.get, key="c_source", horizontal=True)
 
-    dense_extra_filter = None
-    if source == "builder":
-        fts_state = current_builder_state()
+
+def load_builder_example(name: str):
+    ex = BUILDER_EXAMPLES.get(name)
+    state = ex["state"] if ex else fq.BLANK
+    info = f"ℹ️ **Demonstrates:** {ex['shows']}\n\n{ex['description']}" if ex else ""
+    return builder_values_from_state(state) + list(visibility(state["scoring"], state["lucene_mode"])) + [info]
+
+
+def on_lucene_mode(lucene_mode, scoring, raw, *clause_values):
+    vis = visibility(scoring, lucene_mode)
+    if lucene_mode == "raw" and not str(raw or "").strip():
+        rows = [clause_values[i:i + 5] for i in range(0, len(clause_values), 5)]
+        clauses = [{"occur": o, "kind": k, "value": v, "slop": s, "boost": b} for o, k, v, s, b in rows]
         try:
-            preview = fq.build_request(fts_state, top_k, INCLUDE_FIELDS)
-        except fq.QueryError as e:
-            st.warning(f"Query builder: {e} Set up a query in the Query builder mode first.")
-            return
-        st.code(json.dumps({k: preview[k] for k in ("score_by", "filter") if k in preview}, indent=2), language="json")
-        if preview.get("filter") and st.checkbox(
-            "Apply the builder's filters to the dense search too",
-            key="c_share_filters",
-            help="Makes the dense side a hybrid (dense ranking + the same hard filters), isolating the effect of the ranking signal.",
-        ):
-            dense_extra_filter = fq.build_filter(fts_state)
+            raw = fq.clauses_to_lucene(clauses)
+        except fq.QueryError:
+            pass
+    return (*vis, raw)
+
+
+def do_builder(top_k, *values):
+    state = builder_state(list(values))
+    try:
+        req = fq.build_request(state, int(top_k), INCLUDE_FIELDS)
+        resp = search(req)
+    except fq.QueryError as e:
+        return error_html(str(e))
+    except Exception as e:
+        return error_html(f"Search failed: {e}")
+    return results_html([match_record(m) for m in resp.matches], fq.highlight_terms(state))
+
+
+def compare_example(name: str):
+    ex = next((e for e in fq.MODE_EXAMPLES["compare"] if e["name"] == name), None)
+    n_builder = len(load_builder_example(BLANK))
+    if not ex:
+        return [gr.update(), gr.update(), ""] + [gr.update()] * n_builder
+    builder = load_builder_example(ex["builder_example"]) if ex.get("builder_example") else [gr.update()] * n_builder
+    return [ex["values"]["c_query"], ex["values"]["c_source"], f"ℹ️ {ex['description']}"] + builder
+
+
+def compare_source_preview(source, top_k, *values):
+    if source != "builder":
+        return gr.update(visible=False), gr.update(visible=False)
+    try:
+        req = fq.build_request(builder_state(list(values)), int(top_k), INCLUDE_FIELDS)
+    except fq.QueryError as e:
+        return gr.update(visible=True, value=f"// Query builder: {e}"), gr.update(visible=False)
+    shown = {k: req[k] for k in ("score_by", "filter") if k in req}
+    return gr.update(visible=True, value=json.dumps(shown, indent=2)), gr.update(visible="filter" in req)
+
+
+def do_compare(query, source, share_filters, tickers, years, top_k, *values):
+    empty = ("", "", pd.DataFrame(), "", "")
+    if not str(query or "").strip():
+        return (error_html("Enter a query."),) + empty[1:]
+    dense_extra = None
+    if source == "builder":
+        fts_state = builder_state(list(values))
+        if share_filters:
+            dense_extra = fq.build_filter(fts_state)
     else:
         fts_state = {**fq.BLANK, "scoring": "text", "bm25": query}
+    try:
+        res = run_compare(query, fts_state, metadata_filter(tickers, years), dense_extra, int(top_k))
+    except fq.QueryError as e:
+        return (error_html(f"Query builder: {e}"),) + empty[1:]
+    except Exception as e:
+        return (error_html(f"Search failed: {e}"),) + empty[1:]
 
-    if tickers or years:
-        st.caption("Sidebar ticker / year filters apply to both searches.")
+    stats = compare_stats(res)
+    dense, fts, terms = res["dense"], res["fts"], res["terms"]
+    dense_rank, fts_rank, shared, union = stats["dense_rank"], stats["fts_rank"], stats["shared"], stats["union"]
 
-    if st.button("Compare", type="primary", disabled=not query.strip(), key="c_run"):
-        with st.spinner("Running dense and full-text searches in parallel..."):
-            try:
-                ss.c_results = run_compare(query, fts_state, build_filter(tickers, years), dense_extra_filter, top_k)
-            except Exception as e:
-                ss.pop("c_results", None)
-                st.error(f"Search failed: {e}")
+    metrics = "".join([
+        metric_html("Overlap", f"{len(shared)} / {stats['k']}", f"Jaccard {len(shared) / len(union):.0%}" if union else ""),
+        metric_html("Only dense", str(len(dense_rank.keys() - shared))),
+        metric_html("Only full-text", str(len(fts_rank.keys() - shared))),
+        metric_html("Dense latency", f"{res['embed_ms'] + res['dense_ms']:.0f} ms",
+                    f"embed {res['embed_ms']:.0f} + search {res['dense_ms']:.0f}"),
+        metric_html("Full-text latency", f"{res['fts_ms']:.0f} ms"),
+    ])
+    summary = f"<div class='metrics'>{metrics}</div>"
+    if stats["cov_dense"] is not None:
+        summary += (
+            f"<div class='count'><b>Keyword coverage</b> — average share of the full-text terms "
+            f"({html.escape(', '.join(terms))}) present in each result: dense <b>{stats['cov_dense']:.0%}</b> vs "
+            f"full-text <b>{stats['cov_fts']:.0%}</b>. Low dense coverage means it is finding paraphrases and related "
+            "concepts the keywords miss.</div>"
+        )
 
-    if ss.get("c_results"):
-        render_compare_results(ss.c_results)
+    def side(rows, other_ranks, other_name, title):
+        cards = []
+        for i, r in enumerate(rows, 1):
+            hits, n = keyword_coverage(r["text"], terms)
+            cov = f" · keywords {hits}/{n}" if n else ""
+            cards.append(card_html(r, terms, rank=i, badge=rank_badge(r["id"], other_ranks, other_name) + cov))
+        body = "".join(cards) or "<div class='count'>No results.</div>"
+        return f"<div><h4>{title}</h4>{body}</div>"
 
-
-# ── Layout ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SEC Search", layout="wide")
-st.title("SEC Document Search")
-
-if _missing_env:
-    st.error(
-        f"Missing environment variable(s): {', '.join(_missing_env)}. "
-        "Set them in `.env` locally, or as Secrets in the Hugging Face Space settings."
+    side_by_side = (
+        "<div class='cols'>"
+        + side(dense, fts_rank, "full-text", "Dense (semantic)")
+        + side(fts, dense_rank, "dense", "Full-text (BM25 / Lucene)")
+        + "</div>"
     )
-    st.stop()
 
-mode = st.radio(
-    "Search mode",
-    [
-        "Full-text",
-        "Query builder (full-text)",
-        "Semantic (dense)",
-        "Hybrid (semantic + text filter)",
-        "Compare: dense vs full-text",
-    ],
-    horizontal=True,
-)
-is_builder = mode == "Query builder (full-text)"
+    fused_cards = []
+    for i, (doc_id, score) in enumerate(rrf_fuse(stats), 1):
+        r = {**stats["by_id"][doc_id], "score": score}
+        d, f = dense_rank.get(doc_id), fts_rank.get(doc_id)
+        fused_cards.append(card_html(r, terms, rank=i, badge=f"dense #{d if d else '—'} · full-text #{f if f else '—'}"))
+    fused = (
+        f"<div class='count'>Reciprocal rank fusion merges both lists client-side: score = Σ 1 / ({RRF_K} + rank). "
+        "Documents found by both searches rise to the top — a preview of what a two-query hybrid returns.</div>"
+        + "".join(fused_cards)
+    )
 
-with st.sidebar:
-    st.header("Filters")
-    if is_builder:
-        st.caption("The query builder has its own filters in the main panel.")
-        sel_tickers, sel_years = [], []
-    else:
-        sel_tickers = st.multiselect("Ticker", TICKERS, placeholder="All companies")
-        sel_years = st.multiselect("Year", YEARS, placeholder="All years")
-    top_k = st.slider("Results", min_value=3, max_value=25, value=10)
+    return summary, side_by_side, pd.DataFrame(rank_rows(res, stats)), fused, json.dumps(res["fts_req"], indent=2)
 
-st.divider()
 
-# ── Query builder ─────────────────────────────────────────────────────────────
-if is_builder:
-    render_builder(top_k)
-
-elif mode == "Compare: dense vs full-text":
-    render_compare(top_k, sel_tickers, sel_years)
-
-# ── Full-text ─────────────────────────────────────────────────────────────────
-elif mode == "Full-text":
-    example_picker("fulltext")
-    query = st.text_input("Keyword query", key="ft_query", placeholder="e.g. revenue growth operating income")
-    if st.button("Search", type="primary", disabled=not query):
-        with st.spinner("Searching..."):
-            resp = run_search_text(query, sel_tickers, sel_years, top_k)
-        render_results(resp.matches, fq.highlight_terms({"scoring": "text", "bm25": query}))
-
-# ── Semantic ──────────────────────────────────────────────────────────────────
-elif mode == "Semantic (dense)":
-    example_picker("semantic")
-    query = st.text_input("Semantic query", key="sem_query", placeholder="e.g. risks related to supply chain disruption")
-    if st.button("Search", type="primary", disabled=not query):
-        with st.spinner("Embedding & searching..."):
-            resp = run_search_semantic(query, sel_tickers, sel_years, top_k)
-        render_results(resp.matches)
-
-# ── Hybrid ────────────────────────────────────────────────────────────────────
-elif mode == "Hybrid (semantic + text filter)":
-    example_picker("hybrid")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        sem_query = st.text_input(
-            "Semantic query (drives ranking)",
-            key="hy_sem",
-            placeholder="e.g. cloud infrastructure investment",
-        )
-    with col_b:
-        txt_filter = st.text_input(
-            "Must-contain keywords (full-text filter)",
-            key="hy_txt",
-            placeholder="e.g. Azure AWS capital expenditure",
-            help="All tokens must appear in the document chunk (case-insensitive).",
+with gr.Blocks(title="SEC Search — Pinecone FTS vs Dense") as app:
+    gr.Markdown(
+        "# SEC 10-K Search — Pinecone full-text search vs dense vectors\n"
+        "Six companies (AAPL, AMZN, F, GM, MSFT, ORCL) · 10-K filings 2019–2024 · ~24k chunks. "
+        "Full-text search uses Pinecone's document-schema BM25 / Lucene; dense search uses OpenAI "
+        "`text-embedding-3-small`."
+    )
+    if missing_env():
+        gr.Markdown(
+            f"⚠️ **Missing environment variable(s): {', '.join(missing_env())}.** "
+            "Set them in `.env` locally, or as Secrets in the Space settings."
         )
 
-    if st.button("Search", type="primary", disabled=not sem_query):
-        with st.spinner("Embedding & searching..."):
-            resp = run_search_hybrid(sem_query, txt_filter, sel_tickers, sel_years, top_k)
-        render_results(resp.matches)
+    with gr.Sidebar():
+        gr.Markdown("### Filters")
+        side_tickers = gr.CheckboxGroup(TICKERS, label="Ticker", info="Empty = all companies")
+        side_years = gr.CheckboxGroup([str(y) for y in YEARS], label="Year", info="Empty = all years")
+        top_k = gr.Slider(3, 25, value=10, step=1, label="Results")
+        gr.Markdown("_The Query builder tab has its own filters; these apply to the other tabs._")
+
+    with gr.Tabs():
+        with gr.Tab("Full-text"):
+            ft_ex = gr.Dropdown([BLANK] + [e["name"] for e in fq.MODE_EXAMPLES["fulltext"]], value=BLANK, label="Example queries")
+            ft_info = gr.Markdown()
+            ft_query = gr.Textbox(label="Keyword query", placeholder="e.g. revenue growth operating income")
+            ft_btn = gr.Button("Search", variant="primary")
+            ft_out = gr.HTML()
+
+        with gr.Tab("Query builder (full-text)"):
+            b_ex = gr.Dropdown([BLANK] + list(BUILDER_EXAMPLES), value=BLANK, label="Example queries",
+                               info="Load a pre-built complex query into the builder, then tweak it.")
+            b_info = gr.Markdown()
+            with gr.Accordion("Syntax cheat sheet", open=False):
+                gr.Markdown(CHEAT_SHEET)
+
+            gr.Markdown("### 1 · Scoring (ranks results)")
+            b_scoring = gr.Radio([("Lucene (query_string)", "query_string"), ("BM25 keywords (text)", "text")],
+                                 value="query_string", show_label=False)
+            b_bm25 = gr.Textbox(label="BM25 keywords", placeholder="e.g. battery cells charging range", visible=False)
+            b_lucene_mode = gr.Radio([("Clause builder", "clauses"), ("Raw Lucene", "raw")], value="clauses", label="Lucene input")
+            with gr.Group() as b_clause_group:
+                gr.Markdown("Each row is one clause. **MUST** → `+`, **MUST NOT** → `-`, **SHOULD** → optional (adds score). "
+                            "Slop applies to phrases; boost multiplies a clause's weight. Empty rows are ignored.")
+                clause_comps = []
+                for i in range(N_CLAUSES):
+                    with gr.Row(equal_height=True):
+                        clause_comps += [
+                            gr.Dropdown(fq.OCCURS, value="SHOULD", label="Occur", scale=1, min_width=110),
+                            gr.Dropdown(fq.KINDS, value="term(s)", label="Kind", scale=1, min_width=120),
+                            gr.Textbox(label="Value", scale=3, min_width=160),
+                            gr.Number(value=0, label="Slop ~N", precision=0, minimum=0, maximum=50, scale=1, min_width=80),
+                            gr.Number(value=1.0, label="Boost ^N", minimum=0.1, maximum=20, step=0.5, scale=1, min_width=80),
+                        ]
+            b_raw = gr.Textbox(label="Lucene query", lines=3, visible=False,
+                               placeholder='text:(("supply chain" OR semiconductor) AND shortage) NOT text:(covid)')
+
+            gr.Markdown("### 2 · Filters (hard constraints)")
+            gr.Markdown("**Text-match filters** on the `text` field. Empty rows are ignored.")
+            tf_comps = []
+            for i in range(N_TEXT_FILTERS):
+                with gr.Row(equal_height=True):
+                    tf_comps += [
+                        gr.Dropdown(fq.MATCH_OPS, value="$match_phrase", label="Operator", scale=1, min_width=140),
+                        gr.Textbox(label="Value", scale=3, min_width=160),
+                        gr.Checkbox(label="NOT", value=False, scale=0, min_width=70),
+                    ]
+            b_join = gr.Radio([("AND ($and) — every condition", "all"), ("OR ($or) — at least one", "any")],
+                              value="all", label="Combine text-match filters with")
+            gr.Markdown("**Metadata filters**")
+            with gr.Row():
+                b_tickers = gr.CheckboxGroup(TICKERS, label="Ticker is one of ($in)")
+                b_excl = gr.CheckboxGroup(TICKERS, label="Ticker is not ($nin)")
+            with gr.Row():
+                year_choices = [ANY_YEAR] + [str(y) for y in YEARS]
+                b_year_from = gr.Dropdown(year_choices, value=ANY_YEAR, label="Year from ($gte)")
+                b_year_to = gr.Dropdown(year_choices, value=ANY_YEAR, label="Year to ($lte)")
+                b_chunk_min = gr.Number(value=None, label="Chunk index ≥", precision=0, minimum=0)
+                b_chunk_max = gr.Number(value=None, label="Chunk index ≤", precision=0, minimum=0)
+
+            gr.Markdown("### 3 · Request")
+            b_warn = gr.Markdown()
+            with gr.Tabs():
+                with gr.Tab("JSON"):
+                    b_json = gr.Code(language="json", interactive=False, show_label=False)
+                with gr.Tab("Python"):
+                    b_py = gr.Code(language="python", interactive=False, show_label=False)
+            b_btn = gr.Button("Search", variant="primary")
+            b_out = gr.HTML()
+
+        with gr.Tab("Semantic (dense)"):
+            sem_ex = gr.Dropdown([BLANK] + [e["name"] for e in fq.MODE_EXAMPLES["semantic"]], value=BLANK, label="Example queries")
+            sem_info = gr.Markdown()
+            sem_query = gr.Textbox(label="Semantic query", placeholder="e.g. risks related to supply chain disruption")
+            sem_btn = gr.Button("Search", variant="primary")
+            sem_out = gr.HTML()
+
+        with gr.Tab("Hybrid (semantic + text filter)"):
+            hy_ex = gr.Dropdown([BLANK] + [e["name"] for e in fq.MODE_EXAMPLES["hybrid"]], value=BLANK, label="Example queries")
+            hy_info = gr.Markdown()
+            with gr.Row():
+                hy_sem = gr.Textbox(label="Semantic query (drives ranking)", placeholder="e.g. cloud infrastructure investment")
+                hy_txt = gr.Textbox(label="Must-contain keywords (full-text filter)", placeholder="e.g. Azure AWS capital expenditure",
+                                    info="All tokens must appear in the chunk ($match_all).")
+            hy_btn = gr.Button("Search", variant="primary")
+            hy_out = gr.HTML()
+
+        with gr.Tab("Compare: dense vs full-text"):
+            c_ex = gr.Dropdown([BLANK] + [e["name"] for e in fq.MODE_EXAMPLES["compare"]], value=BLANK, label="Example queries")
+            c_info = gr.Markdown()
+            c_query = gr.Textbox(label="Query", placeholder="e.g. risks from rising interest rates on consumer demand",
+                                 info="Embedded for the dense search. Also used as BM25 keywords unless the full-text side uses the query builder.")
+            c_source = gr.Radio([("Same query as BM25 keywords", "same"), ("Current query-builder query", "builder")],
+                                value="same", label="Full-text side")
+            c_builder_preview = gr.Code(language="json", interactive=False, label="Query-builder request (full-text side)", visible=False)
+            c_share = gr.Checkbox(label="Apply the builder's filters to the dense search too", value=False, visible=False,
+                                  info="Makes the dense side a hybrid, isolating the effect of the ranking signal.")
+            gr.Markdown("_Sidebar ticker / year filters apply to both searches._")
+            c_btn = gr.Button("Compare", variant="primary")
+            c_summary = gr.HTML()
+            with gr.Tabs():
+                with gr.Tab("Side by side"):
+                    c_side = gr.HTML()
+                with gr.Tab("Rank comparison"):
+                    c_table = gr.Dataframe(interactive=False, wrap=True)
+                    gr.Markdown("_Δ rank < 0 → dense ranks it higher; > 0 → full-text ranks it higher. Blank rank = not in that top-k._")
+                with gr.Tab("Fused (RRF)"):
+                    c_rrf = gr.HTML()
+            with gr.Accordion("Full-text request sent", open=False):
+                c_req = gr.Code(language="json", interactive=False, show_label=False)
+
+    side_inputs = [side_tickers, side_years, top_k]
+    builder_inputs = [b_scoring, b_bm25, b_lucene_mode, b_raw, *clause_comps, *tf_comps,
+                      b_join, b_tickers, b_excl, b_year_from, b_year_to, b_chunk_min, b_chunk_max]
+    builder_vis = [b_bm25, b_lucene_mode, b_clause_group, b_raw]
+
+    ft_ex.change(lambda n: mode_example("fulltext", n, ["ft_query"]), ft_ex, [ft_query, ft_info])
+    sem_ex.change(lambda n: mode_example("semantic", n, ["sem_query"]), sem_ex, [sem_query, sem_info])
+    hy_ex.change(lambda n: mode_example("hybrid", n, ["hy_sem", "hy_txt"]), hy_ex, [hy_sem, hy_txt, hy_info])
+
+    gr.on([ft_btn.click, ft_query.submit], do_fulltext, [ft_query, *side_inputs], ft_out)
+    gr.on([sem_btn.click, sem_query.submit], do_semantic, [sem_query, *side_inputs], sem_out)
+    gr.on([hy_btn.click, hy_sem.submit, hy_txt.submit], do_hybrid, [hy_sem, hy_txt, *side_inputs], hy_out)
+
+    b_ex.change(load_builder_example, b_ex, builder_inputs + builder_vis + [b_info])
+    b_scoring.change(visibility, [b_scoring, b_lucene_mode], builder_vis)
+    b_lucene_mode.change(on_lucene_mode, [b_lucene_mode, b_scoring, b_raw, *clause_comps], builder_vis + [b_raw])
+    gr.on([c.change for c in builder_inputs] + [top_k.change, app.load], builder_preview,
+          [top_k, *builder_inputs], [b_json, b_py, b_warn])
+    b_btn.click(do_builder, [top_k, *builder_inputs], b_out)
+
+    c_ex.change(compare_example, c_ex, [c_query, c_source, c_info] + builder_inputs + builder_vis + [b_info])
+    gr.on([c_source.change] + [c.change for c in builder_inputs], compare_source_preview,
+          [c_source, top_k, *builder_inputs], [c_builder_preview, c_share])
+    gr.on([c_btn.click, c_query.submit], do_compare, [c_query, c_source, c_share, *side_inputs, *builder_inputs],
+          [c_summary, c_side, c_table, c_rrf, c_req])
+
+demo = app
+
+if __name__ == "__main__":
+    app.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False, css=CSS, theme=gr.themes.Soft())

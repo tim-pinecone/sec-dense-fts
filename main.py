@@ -5,8 +5,7 @@ import time
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from pinecone import Pinecone
-from pinecone.preview import SchemaBuilder
+from pinecone import Pinecone, SchemaBuilder
 
 load_dotenv()
 
@@ -23,7 +22,7 @@ oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # ── Index setup ───────────────────────────────────────────────────────────────
 def create_index():
-    if pc.preview.indexes.exists(INDEX_NAME):
+    if pc.indexes.exists(INDEX_NAME):
         print(f"Index '{INDEX_NAME}' already exists, skipping creation.")
         return
 
@@ -33,11 +32,12 @@ def create_index():
         .add_dense_vector_field("embedding", dimension=EMBED_DIM, metric="cosine")
         .build()
     )
-    pc.preview.indexes.create(name=INDEX_NAME, schema=schema)
-    print(f"Created index '{INDEX_NAME}' — waiting for Ready...")
-    while not pc.preview.indexes.describe(INDEX_NAME).status.ready:
-        time.sleep(5)
-        print("  still initializing...")
+    print(f"Creating index '{INDEX_NAME}' and waiting for Ready...")
+    pc.indexes.create(
+        name=INDEX_NAME,
+        schema=schema,
+        deployment={"deployment_type": "managed", "cloud": "aws", "region": "us-east-1"},
+    )
     print("Index is ready.")
 
 
@@ -163,7 +163,7 @@ def print_results(resp, label: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     create_index()
-    idx = pc.preview.index(name=INDEX_NAME)
+    idx = pc.index(name=INDEX_NAME)
 
     docs = load_docs("example_data")
     ingest(idx, docs)
