@@ -1,5 +1,5 @@
 ---
-title: SEC 10-K Search — Pinecone FTS vs Dense
+title: SEC FTS Hybrid Comparison
 emoji: 🔎
 colorFrom: blue
 colorTo: indigo

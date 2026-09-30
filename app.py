@@ -354,7 +354,7 @@ def do_compare(query, source, share_filters, tickers, years, top_k, *values):
     return summary, side_by_side, pd.DataFrame(rank_rows(res, stats)), fused, json.dumps(res["fts_req"], indent=2)
 
 
-with gr.Blocks(title="SEC Search — Pinecone FTS vs Dense") as app:
+with gr.Blocks(title="SEC FTS Hybrid Comparison") as app:
     gr.Markdown(
         "# SEC 10-K Search — Pinecone full-text search vs dense vectors\n"
         "Six companies (AAPL, AMZN, F, GM, MSFT, ORCL) · 10-K filings 2019–2024 · ~24k chunks. "
